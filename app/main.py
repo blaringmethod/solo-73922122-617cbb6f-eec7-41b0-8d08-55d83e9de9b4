@@ -12,7 +12,7 @@ from typing import List
 
 from fastapi import FastAPI, HTTPException, Query, Request, status
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from .db import Database, VersionConflict
 from .models import (
@@ -104,9 +104,10 @@ def _infeasible_handler(_request: Request, exc: InfeasibleOriginalGrade):
 
 @app.exception_handler(VersionDrift)
 def _drift_handler(_request: Request, exc: VersionDrift):
+    # detail 内含重判用版、入仓复核时版号与期间换版链路，409 与退回记录口径一致
     return JSONResponse(
         status_code=status.HTTP_409_CONFLICT,
-        content={"detail": {"reason": "version_drift", "message": str(exc)}},
+        content={"detail": exc.detail},
     )
 
 
@@ -136,6 +137,9 @@ def health():
 class ActivateResponse(BaseModel):
     code: str
     active: bool
+    switched: bool = Field(
+        ..., description="是否实际切换到另一个版号；重启用现行版时为 false"
+    )
 
 
 @app.post("/api/versions", response_model=VersionOut, status_code=status.HTTP_201_CREATED,
@@ -167,10 +171,15 @@ def get_rules(code: str):
 
 @app.post("/api/versions/{code}/activate", response_model=ActivateResponse, tags=["rules"])
 def activate_version(code: str):
-    """启用新版本。重判开始到入仓前调用本接口会使该批重判在入仓时退回。"""
-    if not get_db().activate(code):
+    """启用指定版号。
+
+    仅当实际启用了另一个版号才算换版（会使进行中的重判在入仓时退回 409）；
+    重启用现行版不算换版，进行中的重判仍可照常入仓。
+    """
+    result = get_db().activate(code)
+    if result is None:
         raise HTTPException(status_code=404, detail=f"规则版号不存在: {code}")
-    return ActivateResponse(code=code, active=True)
+    return ActivateResponse(code=code, active=True, switched=result["switched"])
 
 
 @app.get("/api/active", tags=["rules"])
@@ -190,7 +199,9 @@ def rejudge(body: RejudgeRequest):
     * 出现多个等级：``unique=false``，``options`` 列出各等级、一对可行测值（见证点）
       及该等级的可行测值对总数；
     * 原等级无解：422，报样号并退回整批，不覆盖历史成功结果；
-    * 重判期间换版：409，整批退回，下游继续查到上一份成功结果及其所用版号。
+    * 从读取现行版号到提交前只要**实际换过版**（含 v2→v3→v2 这类切回）：409，
+      整批退回并保留上一份成功结果；响应与退回记录均给出重判用版、入仓复核时
+      版号与期间换版链路。仅发布不启用、重启用现行版均不算换版，可照常入仓。
     """
     return rejudge_batch(get_db(), body)
 

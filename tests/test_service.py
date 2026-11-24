@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 import pytest
 
 from app.db import Database
@@ -142,54 +144,236 @@ def test_original_version_missing(db):
         rejudge_batch(db, req)
 
 
-def test_version_drift_keeps_last_success(db):
-    # 第一次成功入仓 v2 结果
+def _commit_with_snapshot(db: Database, batch_no: str, snapshot):
+    """用给定（可能已过期的）快照走一次入仓复核，返回事务结果。"""
+    req = _req(batch_no)
+    payload = {
+        "batch_no": batch_no,
+        "original_version": "v1",
+        "judged_version": snapshot.code,
+        "record_count": len(req.records),
+        "samples": [],
+    }
+    return db.save_batch_result(
+        batch_no=batch_no,
+        original_code="v1",
+        judged_code=snapshot.code,
+        record_count=len(req.records),
+        result_payload=payload,
+        expected_active_version_id=snapshot.version_id,
+        baseline_switch_epoch=snapshot.switch_epoch,
+    )
+
+
+def test_switch_away_and_back_still_rejects_409(db):
+    """核心缺陷：v2 重判期间 v2→v3→v2，复核时版号相同也必须整批退回。"""
     first = rejudge_batch(db, _req("B2"))
     assert first["judged_version"] == "v2"
 
-    # 发布并启用 v3（重判期间允许换版）
+    # 重判开始于 v2，先拍快照
+    snapshot = db.get_active_snapshot()
+    assert snapshot.code == "v2"
+
+    # 计算期间先发布启用 v3，又切回 v2（复核时现行版与重判用版同为 v2）
     db.create_version("v3", [r.model_dump() for r in V3_RULES], note="v3", activate=True)
-    assert db.get_active()[1] == "v3"
+    assert db.activate("v2")["switched"] is True
+    assert db.get_active()[1] == "v2"
 
-    # 模拟一次"开始于 v2、入仓时已换版"的重判：直接写库必然被版本守卫拒绝
-    active_id_v2 = db.get_version_id("v2")
-    committed = db.save_batch_result(
-        batch_no="B2",
-        original_code="v1",
-        judged_code="v2",
-        record_count=3,
-        result_payload={"stale": True},
-        expected_active_version_id=active_id_v2,
+    outcome = _commit_with_snapshot(db, "B2", snapshot)
+    assert outcome.committed is False
+    # 复核时确为 v2，但期间实际换过版 => 退回，并准确报告复核版
+    assert outcome.review_code == "v2"
+    assert [s["code"] for s in outcome.switches] == ["v3", "v2"]
+
+    # 服务层用同一过期快照也必须抛 VersionDrift（直接驱动编排层守卫）
+    with pytest.raises(VersionDrift) as exc:
+        rejudge_batch_with_snapshot(db, _req("B2"), snapshot)
+    detail = exc.value.detail
+    assert detail["rejudge_version"] == "v2"
+    assert detail["review_version"] == "v2"
+    assert detail["switched_during_rejudge"] is True
+    assert detail["switch_chain"] == ["v2", "v3", "v2"]
+    assert all(s["switched"] == 1 for s in detail["switches"])
+
+    # 退回记录与 409 同口径，且上一份成功结果原样保留
+    rej = db.list_rejections("B2")[0]
+    assert rej["reason"] == "version_drift"
+    assert rej["detail"]["rejudge_version"] == "v2"
+    assert rej["detail"]["review_version"] == "v2"
+    assert rej["detail"]["switch_chain"] == ["v2", "v3", "v2"]
+    row = db.get_batch_result("B2")
+    assert row["judged_version"] == "v2"
+    assert row["record_count"] == 3  # 未被空/新结果覆盖
+
+
+def rejudge_batch_with_snapshot(db: Database, req: RejudgeRequest, snapshot):
+    """测试辅助：强制以指定快照走完整编排（模拟换版发生在拍快照之后）。"""
+    from app.rejudge import evaluate_sample
+
+    original_rules = db.get_rules(db.get_version_id(req.original_version))
+    current_rules = db.get_rules(snapshot.version_id)
+    samples = []
+    for rec in req.records:
+        options = evaluate_sample(
+            (rec.moisture.lo, rec.moisture.hi),
+            (rec.ash.lo, rec.ash.hi),
+            rec.original_grade,
+            original_rules,
+            current_rules,
+        )
+        assert options is not None
+        samples.append({"sample_no": rec.sample_no})
+    payload = {
+        "batch_no": req.batch_no,
+        "original_version": req.original_version,
+        "judged_version": snapshot.code,
+        "record_count": len(req.records),
+        "samples": samples,
+    }
+    outcome = db.save_batch_result(
+        batch_no=req.batch_no,
+        original_code=req.original_version,
+        judged_code=snapshot.code,
+        record_count=len(req.records),
+        result_payload=payload,
+        expected_active_version_id=snapshot.version_id,
+        baseline_switch_epoch=snapshot.switch_epoch,
     )
-    assert committed is False
+    if not outcome.committed:
+        switch_chain = [snapshot.code] + [s["code"] for s in outcome.switches]
+        detail = {
+            "reason": "version_drift",
+            "message": "重判期间启用版本发生过实际切换，整批退回，保留上一份成功结果",
+            "rejudge_version": snapshot.code,
+            "review_version": outcome.review_code,
+            "switched_during_rejudge": True,
+            "switch_chain": switch_chain,
+            "switches": outcome.switches,
+        }
+        db.record_rejection(req.batch_no, "version_drift", detail)
+        from app.service import VersionDrift as _VD
 
-    # 服务层同样以当前启用版（v3）为快照，提交成功，不会产生漂移异常
-    payload = rejudge_batch(db, _req("B2"))
+        raise _VD(detail)
+    return payload
+
+
+def test_review_version_reported_correctly_when_still_on_v3(db):
+    """复核时仍是 v3 的场景：退回记录不得把复核版报成重判用版 v2。"""
+    rejudge_batch(db, _req("B3"))
+    snapshot = db.get_active_snapshot()
+    db.create_version("v3", [r.model_dump() for r in V3_RULES], note="v3", activate=True)
+
+    outcome = _commit_with_snapshot(db, "B3", snapshot)
+    assert outcome.committed is False
+    assert outcome.review_code == "v3"
+    assert [s["code"] for s in outcome.switches] == ["v3"]
+    # 历史成功结果保留
+    assert db.get_batch_result("B3")["judged_version"] == "v2"
+
+
+def test_publish_only_does_not_count_as_switch(db):
+    """单独发布（不启用）不推进换版纪元，重判照常入仓。"""
+    snapshot = db.get_active_snapshot()
+    db.create_version("v3", [r.model_dump() for r in V3_RULES], note="v3", activate=False)
+    assert db.get_active()[1] == "v2"
+    # 发布后纪元不变，旧快照仍可入仓
+    assert _commit_with_snapshot(db, "B4", snapshot).committed is True
+
+    payload = rejudge_batch(db, _req("B4"))
+    assert payload["judged_version"] == "v2"
+    assert db.list_rejections("B4") == []
+    assert db.get_batch_result("B4")["judged_version"] == "v2"
+
+
+def test_reactivate_current_version_does_not_count_as_switch(db):
+    """重启用现行版（switched=0）不算换版，进行中的重判可照常入仓。"""
+    snapshot = db.get_active_snapshot()
+    result = db.activate("v2")
+    assert result["switched"] is False
+    assert _commit_with_snapshot(db, "B5", snapshot).committed is True
+
+    payload = rejudge_batch(db, _req("B5"))
+    assert payload["judged_version"] == "v2"
+    assert db.list_rejections("B5") == []
+
+
+def test_publish_with_activation_of_new_version_counts_as_switch(db):
+    """发布即启用另一个版号 => 实际换版，进行中重判退回 409。"""
+    rejudge_batch(db, _req("B6"))
+    snapshot = db.get_active_snapshot()
+    db.create_version("v3", [r.model_dump() for r in V3_RULES], note="v3", activate=True)
+
+    with pytest.raises(VersionDrift) as exc:
+        rejudge_batch_with_snapshot(db, _req("B6"), snapshot)
+    detail = exc.value.detail
+    assert detail["rejudge_version"] == "v2"
+    assert detail["review_version"] == "v3"
+    assert detail["switch_chain"] == ["v2", "v3"]
+    # 上一份成功结果保留
+    assert db.get_batch_result("B6")["judged_version"] == "v2"
+
+
+def test_successful_rejudge_after_switch_uses_new_version(db):
+    """换版后重新发起的重判以新版为快照，成功入仓并覆盖最后成功结果。"""
+    rejudge_batch(db, _req("B7"))
+    db.create_version("v3", [r.model_dump() for r in V3_RULES], note="v3", activate=True)
+
+    payload = rejudge_batch(db, _req("B7"))
     assert payload["judged_version"] == "v3"
+    row = db.get_batch_result("B7")
+    assert row["judged_version"] == "v3" and len(row["result"]["samples"]) == 3
 
-    # 用 monkeypatch 锁定一个旧快照，验证漂移时服务层确实抛 VersionDrift
-    original_get_active = db.get_active
 
-    def stale_snapshot():
-        return active_id_v2, "v2"
+def test_drift_guard_is_process_safe_via_sqlite(db):
+    """两个 Database 实例（各自独立连接，等价同库多进程）遵守同一入仓规则。"""
+    other = Database(db.path)
+    rejudge_batch(db, _req("B8"))
+    snapshot = db.get_active_snapshot()  # 重判开始于 v2
 
-    db.get_active = stale_snapshot  # type: ignore[method-assign]
+    barrier = threading.Barrier(2)
+
+    def switcher():
+        barrier.wait()
+        other.create_version(
+            "v3", [r.model_dump() for r in V3_RULES], note="v3", activate=True
+        )
+        other.activate("v2")  # 切回 v2，制造 v2→v3→v2
+
+    t = threading.Thread(target=switcher)
+    t.start()
+    barrier.wait()
     try:
         with pytest.raises(VersionDrift):
-            rejudge_batch(db, _req("B2"))
+            rejudge_batch_with_snapshot(db, _req("B8"), snapshot)
     finally:
-        db.get_active = original_get_active  # type: ignore[method-assign]
+        t.join()
 
-    # 漂移退回不覆盖：下游仍查到此前 v3 的成功结果及其所用版号
-    row = db.get_batch_result("B2")
-    assert row["judged_version"] == "v3"
-    assert db.list_rejections("B2")[0]["reason"] == "version_drift"
+    assert db.get_active()[1] == "v2"
+    assert db.get_batch_result("B8")["judged_version"] == "v2"  # 旧结果保留
+    rej = db.list_rejections("B8")[0]
+    assert rej["detail"]["switch_chain"] == ["v2", "v3", "v2"]
 
-    # 在 v3 下重新提交成功 => 覆盖为最后一次成功结果
-    ok = rejudge_batch(db, _req("B2"))
-    assert ok["judged_version"] == "v3"
-    row = db.get_batch_result("B2")
-    assert row["judged_version"] == "v3" and len(row["result"]["samples"]) == 3
+
+def test_activation_log_epoch_semantics(db):
+    """审计纪元：仅 switched=1 推进；重启用现行版不推进。"""
+    snap0 = db.get_active_snapshot()
+    assert snap0.code == "v2"  # 种子 create_version(activate=True) 记一次实际换版
+    baseline_epoch = snap0.switch_epoch
+    assert baseline_epoch > 0
+
+    db.activate("v2")  # no-op：不推进纪元
+    assert db.get_active_snapshot().switch_epoch == baseline_epoch
+
+    db.create_version("v3", [r.model_dump() for r in V3_RULES], note="v3", activate=True)
+    snap_v3 = db.get_active_snapshot()
+    assert snap_v3.code == "v3" and snap_v3.switch_epoch > baseline_epoch
+
+    db.activate("v2")
+    snap_v2 = db.get_active_snapshot()
+    assert snap_v2.code == "v2" and snap_v2.switch_epoch > snap_v3.switch_epoch
+
+    db.activate("v2")  # 再次 no-op
+    assert db.get_active_snapshot().switch_epoch == snap_v2.switch_epoch
 
 
 def test_duplicate_version_conflict(db):
@@ -215,3 +399,57 @@ def test_interval_validation(db):
         Interval(lo=-1, hi=5)
     with pytest.raises(Exception):
         Interval(lo=0, hi=10001)
+
+
+def test_legacy_sqlite_db_upgrade_preserves_everything(tmp_path):
+    """旧结构库（无 activation_log 表）升级后：现行版、批次结果、退回记录全保留。"""
+    import sqlite3
+
+    legacy_path = str(tmp_path / "legacy.db")
+    # 1) 用当前代码造一份带数据的库，再删掉新表，模拟上线前的旧结构库
+    seeded = Database(legacy_path)
+    seeded.create_version("v1", [r.model_dump() for r in V1_RULES], note="old", activate=False)
+    seeded.create_version("v2", [r.model_dump() for r in V2_RULES], note="new", activate=True)
+    rejudge_batch(seeded, _req("B-LEGACY"))
+    seeded.record_rejection("B-LEGACY", "infeasible_original_grade", {"sample_nos": ["X"]})
+    del seeded
+
+    with sqlite3.connect(legacy_path) as raw:
+        raw.execute("DROP TABLE activation_log")
+        raw.commit()
+        legacy_tables = {
+            r[0]
+            for r in raw.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+    assert "activation_log" not in legacy_tables
+
+    # 2) 用新代码重新打开 => 自动迁移
+    upgraded = Database(legacy_path)
+
+    # 现行版保留
+    active = upgraded.get_active_snapshot()
+    assert active is not None and active.code == "v2"
+    # 迁移基线不推进换版纪元，重判可照常入仓
+    assert active.switch_epoch == 0
+
+    # 已有批次结果保留
+    row = upgraded.get_batch_result("B-LEGACY")
+    assert row is not None and row["judged_version"] == "v2"
+    assert len(row["result"]["samples"]) == 3
+
+    # 退回记录保留
+    rejections = upgraded.list_rejections("B-LEGACY")
+    assert any(r["reason"] == "infeasible_original_grade" for r in rejections)
+
+    # 迁移后语义完整：换版仍会被纪元守卫拦截（先拍 v2 快照再换版）
+    snapshot = upgraded.get_active_snapshot()
+    upgraded.create_version(
+        "v3", [r.model_dump() for r in V3_RULES], note="v3", activate=True
+    )
+    upgraded.activate("v2")
+    with pytest.raises(VersionDrift):
+        rejudge_batch_with_snapshot(upgraded, _req("B-LEGACY"), snapshot)
+    # 旧结果仍在
+    assert upgraded.get_batch_result("B-LEGACY")["judged_version"] == "v2"

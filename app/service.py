@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
-from .db import Database
+from .db import ActiveSnapshot, Database
 from .models import RejudgeRequest
 from .rejudge import GradeFeasibility, evaluate_sample
 
@@ -20,7 +20,16 @@ class NoActiveVersion(Exception):
 
 
 class VersionDrift(Exception):
-    """重判开始到入仓前启用版本被切换。"""
+    """重判开始到入仓前实际切换过启用版本（即使又切回快照版）。"""
+
+    def __init__(self, detail: Dict[str, Any]):
+        self.detail = detail
+        chain = " → ".join(detail["switch_chain"]) if detail["switch_chain"] else "无"
+        super().__init__(
+            "重判期间启用版本发生过实际切换："
+            f"重判用版 {detail['rejudge_version']}，入仓复核时版号 "
+            f"{detail['review_version'] or '无'}，期间换版链路 {chain}，整批退回 409"
+        )
 
 
 class InfeasibleOriginalGrade(Exception):
@@ -35,10 +44,11 @@ def rejudge_batch(db: Database, req: RejudgeRequest) -> Dict[str, Any]:
     """执行一批重判并尝试入仓。
 
     流程：
-    1. 取原规则与"重判开始时"的现行规则快照（含版本 id）；
+    1. 取原规则与"重判开始时"的现行规则快照（版本 id、版号、换版纪元）；
     2. 逐条煤样在两个版本并集的压缩网格上求现行可行等级；
     3. 原等级无解的样号收集后整批退回（HTTP 422 语义，不写结果表）；
-    4. 入仓写事务内再次核对启用版本 id，期间换版则整批退回（HTTP 409 语义），
+    4. 入仓写事务内以换版纪元复核：从读取现行版号到提交前只要实际换过版
+       （含 v2→v3→v2 这类切回），整批退回（HTTP 409 语义），
        下游仍可查到该批号上一份成功结果及其所用版号。
     """
     original_id = db.get_version_id(req.original_version)
@@ -46,11 +56,10 @@ def rejudge_batch(db: Database, req: RejudgeRequest) -> Dict[str, Any]:
         raise OriginalVersionNotFound(req.original_version)
     original_rules = db.get_rules(original_id)
 
-    active = db.get_active()
-    if active is None:
+    snapshot: Optional[ActiveSnapshot] = db.get_active_snapshot()
+    if snapshot is None:
         raise NoActiveVersion("尚无启用的规则版本")
-    active_id, active_code = active
-    current_rules = db.get_rules(active_id)
+    current_rules = db.get_rules(snapshot.version_id)
 
     samples_payload: List[Dict[str, Any]] = []
     infeasible: List[str] = []
@@ -79,33 +88,36 @@ def rejudge_batch(db: Database, req: RejudgeRequest) -> Dict[str, Any]:
     payload = {
         "batch_no": req.batch_no,
         "original_version": req.original_version,
-        "judged_version": active_code,
+        "judged_version": snapshot.code,
         "record_count": len(req.records),
         "samples": samples_payload,
     }
 
-    committed = db.save_batch_result(
+    outcome = db.save_batch_result(
         batch_no=req.batch_no,
         original_code=req.original_version,
-        judged_code=active_code,
+        judged_code=snapshot.code,
         record_count=len(req.records),
         result_payload=payload,
-        expected_active_version_id=active_id,
+        expected_active_version_id=snapshot.version_id,
+        baseline_switch_epoch=snapshot.switch_epoch,
     )
-    if not committed:
-        current = db.get_active()
-        db.record_rejection(
-            req.batch_no,
-            "version_drift",
-            {
-                "snapshot_version": active_code,
-                "current_version": current[1] if current else None,
-            },
-        )
-        raise VersionDrift(
-            f"重判期间启用版本已由 {active_code} 切换为 "
-            f"{current[1] if current else '无'}"
-        )
+    if not outcome.committed:
+        # 换版链路：从快照版开始，按审计顺序串起每次实际切换后的版号
+        switch_chain = [snapshot.code] + [s["code"] for s in outcome.switches]
+        detail = {
+            "reason": "version_drift",
+            "message": (
+                "重判期间启用版本发生过实际切换，整批退回，保留上一份成功结果"
+            ),
+            "rejudge_version": snapshot.code,
+            "review_version": outcome.review_code,
+            "switched_during_rejudge": True,
+            "switch_chain": switch_chain,
+            "switches": outcome.switches,
+        }
+        db.record_rejection(req.batch_no, "version_drift", detail)
+        raise VersionDrift(detail)
     return payload
 
 
